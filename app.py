@@ -1,6 +1,8 @@
 import streamlit as st
-from google import genai
 import pandas as pd
+import gc
+import warnings
+warnings.filterwarnings('ignore')
 
 # Configuración de la página
 st.set_page_config(page_title="Gestor de Juicios Evaluativos", layout="wide")
@@ -11,37 +13,302 @@ Esta aplicación te permite analizar, visualizar y exportar los resultados de lo
 
 Carga el archivo de juicios evaluativos generado por el SENA y explora diferentes análisis: distribución de estados de los aprendices, porcentajes de aprobación por resultado de aprendizaje, mapas de calor, análisis por funcionario y más. Puedes filtrar los resultados por resultado de aprendizaje y descargar un reporte personalizado en Excel con formato especial.
 
-
+**✅ Optimizado para archivos grandes (más de 4000 filas)**
 
 """)
 
+def leer_excel_robusto(archivo, skiprows=0, nrows=None):
+    """
+    Función robusta para leer archivos Excel grandes con múltiples estrategias.
+    Soporta .xls, .xlsx, .xlsb y maneja archivos de gran tamaño.
+    """
+    nombre_archivo = archivo.name.lower()
+    
+    # Estrategias de lectura ordenadas por eficiencia para archivos grandes
+    estrategias = []
+    
+    if nombre_archivo.endswith('.xlsb'):
+        estrategias.append(('pyxlsb', 'pyxlsb'))
+    elif nombre_archivo.endswith('.xlsx'):
+        estrategias.extend([
+            ('openpyxl', 'openpyxl'),
+            ('calamine', 'calamine'),
+            ('xlrd', None)
+        ])
+    elif nombre_archivo.endswith('.xls'):
+        estrategias.extend([
+            ('xlrd', 'xlrd'),
+            ('calamine', 'calamine')
+        ])
+    
+    # Agregar estrategia por defecto
+    estrategias.append((None, None))
+    
+    for i, (engine_name, engine) in enumerate(estrategias):
+        try:             
+            # Configurar parámetros según el motor
+            kwargs = {
+                'skiprows': skiprows,
+                'header': None if nrows else 0
+            }
+            
+            if nrows is not None:
+                kwargs['nrows'] = nrows
+                
+            if engine:
+                kwargs['engine'] = engine
+            
+            # Leer archivo
+            df = pd.read_excel(archivo, **kwargs)
+            
+            # Validar que se leyeron datos
+            if df.empty:
+                raise ValueError("El archivo está vacío o no contiene datos válidos")
+            
+            
+            return df
+            
+        except Exception as e:
+            error_msg = str(e)
+            st.warning(f"⚠️ Error con {engine_name or 'motor por defecto'}: {error_msg}")
+            
+            # Si es el último intento, mostrar error detallado
+            if i == len(estrategias) - 1:
+                st.error(f"""
+                ❌ **No se pudo leer el archivo después de intentar todos los métodos disponibles.**
+                
+                **Posibles soluciones:**
+                1. Verifica que el archivo no esté corrupto
+                2. Intenta guardar el archivo en formato .xlsx desde Excel
+                3. Si el archivo es muy grande (>100MB), considera dividirlo en partes más pequeñas
+                4. Verifica que el archivo tenga el formato esperado del SENA
+                
+                **Error técnico:** {error_msg}
+                """)
+                return None
+            
+            continue
+    
+    return None
+
+def optimizar_memoria_dataframe(df):
+    """
+    Optimiza el uso de memoria del DataFrame convirtiendo tipos de datos.
+    """
+    if df is None:
+        return None
+    
+    # Columnas que NO deben convertirse a categóricas para evitar errores de concatenación
+    columnas_excluidas = ['Nombre', 'Apellidos', 'Número de Documento']
+        
+    # Optimizar tipos de datos para reducir memoria
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            # Intentar convertir a categoría si hay muchos valores repetidos
+            # pero excluir columnas críticas que se usan en concatenaciones
+            if (df[col].nunique() / len(df) < 0.5 and 
+                col not in columnas_excluidas):  # Si menos del 50% son únicos y no está excluida
+                try:
+                    df[col] = df[col].astype('category')
+                except:
+                    pass
+        elif df[col].dtype == 'int64':
+            # Optimizar enteros
+            try:
+                df[col] = pd.to_numeric(df[col], downcast='integer')
+            except:
+                pass
+        elif df[col].dtype == 'float64':
+            # Optimizar flotantes
+            try:
+                df[col] = pd.to_numeric(df[col], downcast='float')
+            except:
+                pass
+    
+    return df
+
+def leer_archivo_por_chunks(archivo, skiprows=12, chunk_size=5000):
+    """
+    Lee archivos extremadamente grandes por chunks para evitar problemas de memoria.
+    """
+    try:
+        st.info("🔄 Archivo muy grande detectado. Leyendo por chunks para optimizar memoria...")
+        
+        chunks = []
+        chunk_count = 0
+        
+        # Intentar leer por chunks
+        nombre_archivo = archivo.name.lower()
+        engine = None
+        
+        if nombre_archivo.endswith('.xlsb'):
+            engine = 'pyxlsb'
+        elif nombre_archivo.endswith('.xlsx'):
+            engine = 'openpyxl'
+        elif nombre_archivo.endswith('.xls'):
+            engine = 'xlrd'
+        
+        # Leer el archivo completo primero para obtener el número total de filas
+        try:
+            df_temp = pd.read_excel(archivo, skiprows=skiprows, engine=engine, nrows=1)
+            total_cols = df_temp.shape[1]
+            del df_temp
+            gc.collect()
+        except:
+            total_cols = None
+        
+        # Leer por chunks
+        current_row = skiprows
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        while True:
+            try:
+                chunk = pd.read_excel(
+                    archivo, 
+                    skiprows=current_row, 
+                    nrows=chunk_size,
+                    engine=engine,
+                    header=0 if chunk_count == 0 else None
+                )
+                
+                if chunk.empty:
+                    break
+                
+                # Si no es el primer chunk, usar las columnas del primer chunk
+                if chunk_count > 0 and chunks:
+                    chunk.columns = chunks[0].columns
+                
+                chunks.append(chunk)
+                chunk_count += 1
+                current_row += chunk_size
+                
+                # Actualizar progreso
+                status_text.text(f"Procesando chunk {chunk_count}: {len(chunk)} filas leídas")
+                
+                # Limitar memoria liberando chunks antiguos si hay demasiados
+                if len(chunks) > 10:  # Procesar en lotes de 10 chunks
+                    df_partial = pd.concat(chunks, ignore_index=True)
+                    chunks = [df_partial]
+                    gc.collect()
+                
+            except Exception as e:
+                if "No data" in str(e) or chunk.empty:
+                    break
+                else:
+                    raise e
+        
+        progress_bar.progress(100)
+        
+        if chunks:
+            st.info(f"📊 Combinando {chunk_count} chunks...")
+            df_final = pd.concat(chunks, ignore_index=True)
+            
+            # Limpiar memoria
+            del chunks
+            gc.collect()
+            
+            st.success(f"✅ Archivo leído exitosamente por chunks: {df_final.shape[0]:,} filas")
+            return df_final
+        else:
+            st.error("❌ No se pudieron leer datos del archivo")
+            return None
+            
+    except Exception as e:
+        st.error(f"❌ Error al leer archivo por chunks: {str(e)}")
+        return None
+
 # Botón para subir archivo Excel
 df = None
-archivo = st.file_uploader("Sube el archivo Excel de Juicios Evaluativos:", type=["xls", "xlsx"])
+archivo = st.file_uploader(
+    "Sube el archivo Excel de Juicios Evaluativos:", 
+    type=["xls", "xlsx", "xlsb"],
+    help="Formatos soportados: .xls, .xlsx, .xlsb (recomendado para archivos grandes)"
+)
+
 if archivo is not None:
     try:
+        # Mostrar información del archivo
+        file_size = len(archivo.getvalue()) / (1024 * 1024)  # MB
+        st.info(f"📁 **Archivo:** {archivo.name} ({file_size:.1f} MB)")
+        
+        if file_size > 50:
+            st.warning("⚠️ Archivo grande detectado. El procesamiento puede tomar varios minutos.")
+        
         # --- Mostrar información del reporte (filas 1 a 12, solo columnas 0 y 2) ---
-        # Leer las primeras 12 filas como información del reporte
-        info_reporte_full = pd.read_excel(archivo, nrows=12, header=None, engine="xlrd" if archivo.name.endswith(".xls") else None)
-        info_reporte = info_reporte_full[[0, 2]]
-        # Mostrar la información del reporte en Streamlit (solo columnas 0 y 2)
-        # Leer el resto del archivo como datos (saltando las primeras 12 filas)
-        df = pd.read_excel(archivo, skiprows=12, engine="xlrd" if archivo.name.endswith(".xls") else None)
-        print(df.info())  # Mostrar información del DataFrame para depuración
-        # Eliminar columnas vacías
-        df = df.dropna(axis=1, how="all")
-        # --- Filtro en la barra lateral para Resultados de Aprendizaje ---
-        resultados_unicos = df['Resultado de Aprendizaje'].dropna().unique().tolist()
-        resultados_unicos.sort()
-        seleccion_resultados = st.sidebar.multiselect(
-            'Filtrar por Resultados de Aprendizaje:',
-            options=['Todos'] + resultados_unicos,
-            default=['Todos']
-        )
-        if 'Todos' in seleccion_resultados or not seleccion_resultados:
-            df_filtrado = df
-        else:
-            df_filtrado = df[df['Resultado de Aprendizaje'].isin(seleccion_resultados)]
+        with st.spinner("Leyendo información del reporte..."):
+            info_reporte_full = leer_excel_robusto(archivo, nrows=12)
+            
+            if info_reporte_full is not None and info_reporte_full.shape[1] >= 3:
+                info_reporte = info_reporte_full[[0, 2]]
+            else:
+                st.warning("No se pudo leer la información del reporte. Continuando con los datos principales...")
+                info_reporte = pd.DataFrame()
+        
+        # --- Leer el resto del archivo como datos (saltando las primeras 12 filas) ---
+        with st.spinner("Leyendo datos principales del archivo..."):
+            # Intentar lectura normal primero
+            df = leer_excel_robusto(archivo, skiprows=12)
+            
+            # Si falla la lectura normal y el archivo es grande, intentar por chunks
+            if df is None and file_size > 10:  # Si es mayor a 10MB
+                st.warning("⚠️ Lectura normal falló. Intentando lectura por chunks...")
+                df = leer_archivo_por_chunks(archivo, skiprows=12)
+            
+            if df is None:
+                st.error("❌ No se pudo leer el archivo con ningún método disponible.")
+                st.stop()
+        
+        # Optimizar memoria
+        with st.spinner("Optimizando uso de memoria..."):
+            df = optimizar_memoria_dataframe(df)
+            
+            # Eliminar columnas vacías
+            df = df.dropna(axis=1, how="all")
+            
+            # Forzar recolección de basura
+            gc.collect()
+        
+        # Validar estructura del archivo
+        columnas_requeridas = [
+            'Resultado de Aprendizaje', 
+            'Juicio de Evaluación', 
+            'Número de Documento',
+            'Nombre', 
+            'Apellidos', 
+            'Estado'
+        ]
+        
+        columnas_faltantes = [col for col in columnas_requeridas if col not in df.columns]
+        
+        if columnas_faltantes:
+            st.error(f"""
+            ❌ **El archivo no tiene la estructura esperada.**
+            
+            **Columnas faltantes:** {', '.join(columnas_faltantes)}
+            
+            **Columnas encontradas:** {', '.join(df.columns.tolist())}
+            
+            Por favor, verifica que el archivo sea un reporte de juicios evaluativos del SENA con el formato correcto.
+            """)
+            st.stop()
+        
+        # Mostrar estadísticas del archivo procesado
+        st.success(f"🎉 **Archivo procesado exitosamente!**")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("📊 Total de filas", f"{len(df):,}")
+        with col2:
+            st.metric("👥 Estudiantes únicos", f"{df['Número de Documento'].nunique():,}")
+        with col3:
+            st.metric("📚 Resultados de aprendizaje", f"{df['Resultado de Aprendizaje'].nunique():,}")
+        with col4:
+            memoria_mb = df.memory_usage(deep=True).sum() / (1024 * 1024)
+            st.metric("💾 Memoria utilizada", f"{memoria_mb:.1f} MB")
+        
+        # Usar el DataFrame completo sin filtro de Resultados de Aprendizaje
+        df_filtrado = df
         # Si existe la columna 'Fecha y Hora del Juicio Evaluativo', mantenerla en el DataFrame filtrado
         if 'Fecha y Hora del Juicio Evaluativo' in df_filtrado.columns:
             # No eliminar ni modificar, solo asegurar que esté presente en df_filtrado
@@ -145,8 +412,20 @@ if archivo is not None:
                     competencias_cols[competencia] = [col, col]
                 else:
                     competencias_cols[competencia][1] = col
+            
+            # Crear rangos de merge solo si no se superponen
             for competencia, (col_start, col_end) in competencias_cols.items():
-                worksheet.merge_range(0, col_start, 0, col_end, competencia, header_format)
+                try:
+                    if col_start == col_end:
+                        # Si es una sola columna, usar write en lugar de merge_range
+                        worksheet.write(0, col_start, competencia, header_format)
+                    else:
+                        # Solo hacer merge si hay múltiples columnas
+                        worksheet.merge_range(0, col_start, 0, col_end, competencia, header_format)
+                except Exception as e:
+                    # Si hay error en el merge, escribir en cada celda individualmente
+                    for col in range(col_start, col_end + 1):
+                        worksheet.write(0, col, competencia, header_format)
             for col in range(num_index_cols, ncols):
                 worksheet.write(1, col, tabla_export.reset_index().columns[col][1], subheader_format)
             worksheet.set_row(0, 40, header_format)
@@ -268,7 +547,8 @@ if archivo is not None:
             porcentaje_estudiantes = tabla_export[('', '% Aprobado')]
             nombres = tabla_export.index.get_level_values('Nombre')
             apellidos = tabla_export.index.get_level_values('Apellidos')
-            nombres_completos = nombres + ' ' + apellidos
+            # Convertir a string para evitar errores con tipos categóricos
+            nombres_completos = nombres.astype(str) + ' ' + apellidos.astype(str)
             porcentaje_df = pd.DataFrame({'Estudiante': nombres_completos, 'Porcentaje': porcentaje_estudiantes.values})
             porcentaje_df = porcentaje_df.sort_values('Porcentaje', ascending=False)
             import matplotlib.pyplot as plt
@@ -357,8 +637,61 @@ if archivo is not None:
                     ax_cob.text(valor + 1, y.get_y() + y.get_height()/2, f'{valor:.2f}%', va='center', fontsize=8)
                 ax_cob.invert_yaxis()
                 st.pyplot(fig_cob)
+    except MemoryError:
+        st.error("""
+        ❌ **Error de memoria insuficiente**
+        
+        El archivo es demasiado grande para procesar con la memoria disponible.
+        
+        **Soluciones recomendadas:**
+        1. **Convertir a formato .xlsb** (más eficiente para archivos grandes)
+        2. **Dividir el archivo** en partes más pequeñas (máximo 50,000 filas por archivo)
+        3. **Cerrar otras aplicaciones** para liberar memoria
+        4. **Filtrar datos en Excel** antes de cargar (eliminar columnas innecesarias)
+        """)
+    except pd.errors.EmptyDataError:
+        st.error("❌ El archivo está vacío o no contiene datos válidos.")
+    except (ValueError, KeyError) as e:
+        if "Excel file format" in str(e) or "not supported" in str(e):
+            st.error("❌ El archivo no es un archivo Excel válido o está corrupto.")
+        else:
+            raise e
     except Exception as e:
-        st.error(f"Error al leer el archivo Excel: {e}")
+        error_msg = str(e)
+        st.error(f"""
+        ❌ **Error inesperado al procesar el archivo**
+        
+        **Error técnico:** {error_msg}
+        
+        **Posibles soluciones:**
+        1. Verifica que el archivo no esté abierto en Excel
+        2. Intenta guardar el archivo en formato .xlsx o .xlsb
+        3. Verifica que el archivo tenga el formato esperado del SENA
+        4. Si el archivo es muy grande (>100MB), considera dividirlo en partes
+        
+        **Formatos recomendados para archivos grandes:**
+        - **.xlsb** (binario de Excel, más rápido)
+        - **.xlsx** (estándar, compatible)
+        """)
+        
+        # Mostrar información técnica adicional en un expander
+        with st.expander("🔧 Información técnica detallada"):
+            st.code(f"""
+Tipo de error: {type(e).__name__}
+Mensaje: {error_msg}
+Archivo: {archivo.name if archivo else 'N/A'}
+Tamaño: {file_size:.1f} MB
+            """)
+            
+        # Sugerir alternativas
+        st.info("""
+        💡 **¿Necesitas ayuda?**
+        
+        Si continúas teniendo problemas:
+        1. Intenta con un archivo más pequeño para probar la aplicación
+        2. Contacta al administrador del sistema
+        3. Verifica que tengas la versión más reciente de la aplicación
+        """)
 
 # Mostrar créditos al pie de página
 st.markdown("<hr style='margin-top:40px;margin-bottom:10px;'>", unsafe_allow_html=True)
